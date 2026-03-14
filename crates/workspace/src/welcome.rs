@@ -163,7 +163,7 @@ impl SectionEntry {
     }
 }
 
-const CONTENT: (Section<4>, Section<3>) = (
+const CONTENT: (Section<5>, Section<3>) = (
     Section {
         title: "Get Started",
         entries: [
@@ -171,6 +171,12 @@ const CONTENT: (Section<4>, Section<3>) = (
                 icon: IconName::Plus,
                 title: "New File",
                 action: &NewFile,
+                visibility_guard: SectionVisibility::Always,
+            },
+            SectionEntry {
+                icon: IconName::TerminalAlt,
+                title: "New Terminal",
+                action: &crate::NewTerminal { local: false },
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {

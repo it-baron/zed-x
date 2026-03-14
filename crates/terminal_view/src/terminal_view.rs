@@ -6,7 +6,14 @@ pub mod terminal_scrollbar;
 mod terminal_slash_command;
 
 use assistant_slash_command::SlashCommandRegistry;
-use editor::{Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager};
+use anyhow::Context as _;
+use editor::{
+    Editor, EditorSettings, MultiBuffer, actions::SelectAll, blink_manager::BlinkManager,
+    delete_terminal_planning_note, delete_unloaded_terminal_planning_notes,
+    get_terminal_planning_note,
+    rekey_terminal_planning_note_item, rekey_terminal_planning_note_terminal_item,
+    save_terminal_planning_note,
+};
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
@@ -53,9 +60,10 @@ use ui::{
 use util::ResultExt;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
-    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
+    SplitDirection, ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
     item::{
-        BreadcrumbText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
+        BreadcrumbText, Item, ItemEvent, ItemHandle, SerializableItem, TabContentParams,
+        TabTooltipContent,
     },
     register_serializable_item,
     searchable::{
@@ -69,6 +77,7 @@ struct ImeState {
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const PLANNING_NOTE_TITLE: &str = "Plan";
 
 /// Event to transmit the scroll from the element to the view
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +98,8 @@ actions!(
     [
         /// Reruns the last executed task in the terminal.
         RerunTask,
+        /// Opens the terminal's attached planning note.
+        OpenPlanningNote,
     ]
 );
 
@@ -147,6 +158,15 @@ pub struct TerminalView {
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
+    attached_planning_note: Option<Entity<Editor>>,
+    attached_planning_note_working_directory: Option<PathBuf>,
+    attached_planning_note_subscription: Option<Subscription>,
+    attached_planning_note_pane_subscription: Option<Subscription>,
+    attached_planning_note_item_subscription: Option<Subscription>,
+    hiding_attached_planning_note: bool,
+    planning_note_open_in_flight: bool,
+    skip_close_confirmation: bool,
+    restored_terminal_item_id: Option<workspace::ItemId>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -293,6 +313,15 @@ impl TerminalView {
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
             rename_editor_subscription: None,
+            attached_planning_note: None,
+            attached_planning_note_working_directory: None,
+            attached_planning_note_subscription: None,
+            attached_planning_note_pane_subscription: None,
+            attached_planning_note_item_subscription: None,
+            hiding_attached_planning_note: false,
+            planning_note_open_in_flight: false,
+            skip_close_confirmation: false,
+            restored_terminal_item_id: None,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
@@ -481,6 +510,432 @@ impl TerminalView {
             editor.focus_handle(cx).focus(window, cx);
         });
         cx.notify();
+    }
+
+    fn planning_note_context_path(&self, cx: &App) -> Option<PathBuf> {
+        self.terminal
+            .read(cx)
+            .working_directory()
+            .or_else(|| {
+                self.workspace
+                    .upgrade()
+                    .and_then(|workspace| default_working_directory(workspace.read(cx), cx))
+            })
+    }
+
+    fn current_attached_planning_note(&self, cx: &App) -> Option<Entity<Editor>> {
+        let context_path = self.planning_note_context_path(cx)?;
+        if self.attached_planning_note_working_directory.as_deref() != Some(context_path.as_path())
+        {
+            return None;
+        }
+
+        let editor = self.attached_planning_note.as_ref()?.clone();
+        let workspace = self.workspace.upgrade()?;
+        workspace.read(cx).pane_for(&editor).map(|_| editor)
+    }
+
+    fn attached_planning_note_for_working_directory(
+        &self,
+        working_directory: &Path,
+    ) -> Option<Entity<Editor>> {
+        if self.attached_planning_note_working_directory.as_deref() != Some(working_directory) {
+            return None;
+        }
+
+        self.attached_planning_note.clone()
+    }
+
+    fn loaded_attached_planning_note(&self, cx: &App) -> Option<Entity<Editor>> {
+        let editor = self.attached_planning_note.clone()?;
+        let workspace = self.workspace.upgrade()?;
+        workspace.read(cx).pane_for(&editor).map(|_| editor)
+    }
+
+    fn find_loaded_planning_note(
+        &self,
+        serialized_note_item_id: workspace::ItemId,
+        cx: &App,
+    ) -> Option<Entity<Editor>> {
+        let workspace = self.workspace.upgrade()?;
+        workspace.read(cx).items_of_type::<Editor>(cx).find(|editor| {
+            let editor_state = editor.read(cx);
+            editor_state.restored_item_id() == Some(serialized_note_item_id)
+                || editor.entity_id().as_u64() == serialized_note_item_id
+        })
+    }
+
+    fn add_planning_note_to_workspace(
+        &mut self,
+        editor: Entity<Editor>,
+        focus_item: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<()> {
+        let workspace = self.workspace.upgrade()?;
+        if workspace.read(cx).pane_for(&editor).is_some() {
+            if focus_item {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.activate_item(&editor, true, true, window, cx);
+                });
+            }
+            return Some(());
+        }
+
+        let source_pane = workspace.read(cx).pane_for(&cx.entity())?;
+        let new_pane =
+            workspace.update(cx, |workspace, cx| workspace.split_pane(source_pane, SplitDirection::Right, window, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item(
+                new_pane,
+                Box::new(editor),
+                None,
+                focus_item,
+                focus_item,
+                window,
+                cx,
+            )
+        });
+        Some(())
+    }
+
+    fn attach_planning_note(
+        &mut self,
+        editor: Entity<Editor>,
+        working_directory: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let workspace_id = self.workspace_id.context("terminal has no workspace id")?;
+        let terminal_item_id = cx.entity_id().as_u64() as workspace::ItemId;
+        let note_item_id = editor.entity_id().as_u64() as workspace::ItemId;
+        let restored_note_item_id = editor.read(cx).restored_item_id();
+
+        editor.update(cx, |editor, cx| {
+            editor
+                .buffer()
+                .update(cx, |buffer, cx| buffer.set_title(PLANNING_NOTE_TITLE.into(), cx));
+        });
+
+        let planning_note_subscription = editor.on_release(
+            cx,
+            Box::new({
+                let terminal_view = self.self_handle.clone();
+                let released_note_id = editor.entity_id();
+                move |cx| {
+                    terminal_view
+                        .update(cx, |this, cx| {
+                            if this
+                                .attached_planning_note
+                                .as_ref()
+                                .is_some_and(|note| note.entity_id() == released_note_id)
+                            {
+                                this.attached_planning_note = None;
+                                this.attached_planning_note_working_directory = None;
+                                this.attached_planning_note_subscription = None;
+                                cx.emit(ItemEvent::UpdateTab);
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                }
+            }),
+        );
+
+        let working_directory_for_db = working_directory.clone();
+        cx.background_spawn(async move {
+            if let Some(restored_note_item_id) =
+                restored_note_item_id.filter(|old_item_id| *old_item_id != note_item_id)
+            {
+                rekey_terminal_planning_note_item(
+                    workspace_id,
+                    restored_note_item_id,
+                    note_item_id,
+                )
+                .await?;
+            }
+
+            save_terminal_planning_note(
+                workspace_id,
+                terminal_item_id,
+                working_directory_for_db,
+                note_item_id,
+            )
+            .await
+        })
+        .detach_and_log_err(cx);
+
+        self.attached_planning_note = Some(editor);
+        self.attached_planning_note_working_directory = Some(working_directory);
+        self.attached_planning_note_subscription = Some(planning_note_subscription);
+        self.hiding_attached_planning_note = false;
+        self.planning_note_open_in_flight = false;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+        Ok(())
+    }
+
+    fn open_planning_note_with_behavior(
+        &mut self,
+        create_if_missing: bool,
+        focus_item: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_planning_note_pane_subscription(window, cx);
+        self.ensure_planning_note_item_subscription(window, cx);
+
+        let Some(working_directory) = self.planning_note_context_path(cx) else {
+            return;
+        };
+
+        if let Some(editor) = self.current_attached_planning_note(cx) {
+            if focus_item && let Some(workspace) = self.workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.activate_item(&editor, true, true, window, cx);
+                });
+            }
+            return;
+        }
+
+        if let Some(editor) =
+            self.attached_planning_note_for_working_directory(working_directory.as_path())
+        {
+            self.add_planning_note_to_workspace(editor.clone(), focus_item, window, cx);
+            self.attach_planning_note(editor, working_directory, cx).log_err();
+            return;
+        }
+
+        if self.planning_note_open_in_flight {
+            return;
+        }
+
+        let Some(workspace_id) = self.workspace_id else {
+            return;
+        };
+        let terminal_item_id = cx.entity_id().as_u64() as workspace::ItemId;
+
+        let serialized_note_item_id = get_terminal_planning_note(
+            workspace_id,
+            terminal_item_id,
+            working_directory.as_path(),
+        )
+        .log_err()
+        .flatten();
+
+        if let Some(serialized_note_item_id) = serialized_note_item_id {
+            if let Some(editor) = self.find_loaded_planning_note(serialized_note_item_id, cx) {
+                self.attach_planning_note(editor.clone(), working_directory, cx)
+                    .log_err();
+                if focus_item && let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.activate_item(&editor, true, true, window, cx);
+                    });
+                }
+                return;
+            }
+
+            let Some(project) = self.project.upgrade() else {
+                return;
+            };
+            let workspace = self.workspace.clone();
+            self.planning_note_open_in_flight = true;
+            cx.spawn_in(window, async move |this, cx| {
+                let result: anyhow::Result<()> = async {
+                    let deserialize_task = cx.update(|window, cx| {
+                        <Editor as SerializableItem>::deserialize(
+                            project,
+                            workspace,
+                            workspace_id,
+                            serialized_note_item_id,
+                            window,
+                            cx,
+                        )
+                    })?;
+                    let editor = deserialize_task.await?;
+
+                    this.update_in(cx, |this, window, cx| {
+                        this.add_planning_note_to_workspace(editor.clone(), focus_item, window, cx);
+                        this.attach_planning_note(editor, working_directory, cx)
+                    })??;
+                    anyhow::Ok(())
+                }
+                .await;
+
+                if result.is_err() {
+                    let _ = this.update(cx, |this, _cx| {
+                        this.planning_note_open_in_flight = false;
+                    });
+                }
+
+                result
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
+
+        if !create_if_missing {
+            return;
+        }
+
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        self.planning_note_open_in_flight = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<()> = async {
+                let language = language_registry.language_for_name("Markdown").await.ok();
+                let buffer = project
+                    .update(cx, |project, cx| project.create_buffer(language, true, cx))
+                    .await?;
+
+                let editor = cx.update(|window, cx| {
+                    let multibuffer = cx.new(|cx| {
+                        MultiBuffer::singleton(buffer, cx).with_title(PLANNING_NOTE_TITLE.into())
+                    });
+                    cx.new(|cx| Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx))
+                })?;
+
+                this.update_in(cx, |this, window, cx| {
+                    this.add_planning_note_to_workspace(editor.clone(), focus_item, window, cx);
+                    this.attach_planning_note(editor, working_directory, cx)
+                })??;
+                anyhow::Ok(())
+            }
+            .await;
+
+            if result.is_err() {
+                let _ = this.update(cx, |this, _cx| {
+                    this.planning_note_open_in_flight = false;
+                });
+            }
+
+            result
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn open_planning_note(
+        &mut self,
+        _: &OpenPlanningNote,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_planning_note_with_behavior(true, true, window, cx);
+    }
+
+    fn restore_planning_note_if_needed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_planning_note_with_behavior(false, false, window, cx);
+    }
+
+    fn ensure_planning_note_pane_subscription(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.attached_planning_note_pane_subscription.is_some() {
+            return;
+        }
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(source_pane) = workspace.read(cx).pane_for(&cx.entity()) else {
+            return;
+        };
+
+        self.attached_planning_note_pane_subscription =
+            Some(cx.observe_in(&source_pane, window, |_this, pane, window, cx| {
+                let terminal_is_selected = pane
+                    .read(cx)
+                    .active_item()
+                    .is_some_and(|item| item.item_id() == cx.entity_id());
+
+                cx.defer_in(window, move |this, window, cx| {
+                    if terminal_is_selected {
+                        this.restore_planning_note_if_needed(window, cx);
+                    } else {
+                        this.hide_planning_note(window, cx);
+                    }
+                });
+            }));
+    }
+
+    fn detach_planning_note(&mut self, delete_mapping: bool, cx: &mut Context<Self>) {
+        let workspace_id = self.workspace_id;
+        let terminal_item_id = cx.entity_id().as_u64() as workspace::ItemId;
+        let working_directory = self.attached_planning_note_working_directory.clone();
+
+        self.attached_planning_note_item_subscription = None;
+        self.attached_planning_note_subscription = None;
+        self.attached_planning_note = None;
+        self.attached_planning_note_working_directory = None;
+        self.hiding_attached_planning_note = false;
+        self.planning_note_open_in_flight = false;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+
+        if delete_mapping
+            && let (Some(workspace_id), Some(working_directory)) = (workspace_id, working_directory)
+        {
+            cx.background_spawn(async move {
+                delete_terminal_planning_note(workspace_id, terminal_item_id, working_directory)
+                    .await
+            })
+            .detach_and_log_err(cx);
+        }
+    }
+
+    fn ensure_planning_note_item_subscription(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.attached_planning_note_item_subscription.is_some() {
+            return;
+        }
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        self.attached_planning_note_item_subscription = Some(cx.subscribe_in(
+            &workspace,
+            window,
+            |this, _workspace, event: &workspace::Event, _window, cx| match event {
+                workspace::Event::ItemRemoved { item_id } => {
+                    let Some(attached_planning_note) = this.attached_planning_note.as_ref() else {
+                        return;
+                    };
+                    if attached_planning_note.entity_id() != *item_id {
+                        return;
+                    }
+                    if this.hiding_attached_planning_note {
+                        return;
+                    }
+
+                    this.detach_planning_note(true, cx);
+                }
+                _ => {}
+            },
+        ));
+    }
+
+    fn hide_planning_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.loaded_attached_planning_note(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(note_pane) = workspace.read(cx).pane_for(&editor) else {
+            return;
+        };
+
+        self.hiding_attached_planning_note = true;
+        note_pane.update(cx, |pane, cx| {
+            pane.remove_item(editor.entity_id(), false, true, window, cx);
+        });
     }
 
     pub fn clear_bell(&mut self, cx: &mut Context<TerminalView>) {
@@ -951,6 +1406,7 @@ impl TerminalView {
         self._terminal_subscriptions =
             subscribe_for_terminal_events(&terminal, self.workspace.clone(), window, cx);
         self.terminal = terminal;
+        self.skip_close_confirmation = false;
     }
 
     fn rerun_button(task: &TaskState) -> Option<IconButton> {
@@ -1092,7 +1548,10 @@ fn subscribe_for_terminal_events(
                     ),
                 },
                 Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
-                Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
+                Event::CloseTerminal => {
+                    terminal_view.skip_close_confirmation = true;
+                    cx.emit(ItemEvent::CloseItem);
+                }
                 Event::SelectionsChanged => {
                     window.invalidate_character_coordinates();
                     cx.emit(SearchEvent::ActiveMatchChanged)
@@ -1235,6 +1694,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::show_character_palette))
             .on_action(cx.listener(TerminalView::select_all))
             .on_action(cx.listener(TerminalView::rerun_task))
+            .on_action(cx.listener(TerminalView::open_planning_note))
             .on_action(cx.listener(TerminalView::rename_terminal))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(
@@ -1350,6 +1810,30 @@ impl Item for TerminalView {
             },
             None => (IconName::Terminal, Color::Muted, None),
         };
+        let planning_note_attached = self.current_attached_planning_note(cx).is_some();
+        let planning_note_button = IconButton::new(
+            ("planning-note", self.terminal().entity_id().as_u64()),
+            IconName::FileMarkdown,
+        )
+        .icon_size(IconSize::XSmall)
+        .size(ButtonSize::Compact)
+        .icon_color(if planning_note_attached {
+            Color::Accent
+        } else {
+            Color::Muted
+        })
+        .shape(ui::IconButtonShape::Square)
+        .tooltip(move |_window, cx| {
+            Tooltip::for_action("Open planning note", &OpenPlanningNote, cx)
+        })
+        .on_click({
+            let self_handle = self.self_handle.clone();
+            move |_, window, cx| {
+                self_handle
+                    .update(cx, |this, cx| this.open_planning_note(&OpenPlanningNote, window, cx))
+                    .ok();
+            }
+        });
 
         h_flex()
             .gap_1()
@@ -1408,6 +1892,7 @@ impl Item for TerminalView {
                         )
                     }),
             )
+            .child(planning_note_button)
             .into_any()
     }
 
@@ -1421,6 +1906,10 @@ impl Item for TerminalView {
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
         None
+    }
+
+    fn pane_changed(&mut self, _new_pane_id: gpui::EntityId, _cx: &mut Context<Self>) {
+        self.attached_planning_note_pane_subscription = None;
     }
 
     fn handle_drop(
@@ -1639,6 +2128,14 @@ impl Item for TerminalView {
         false
     }
 
+    fn close_message(&self, _cx: &App) -> Option<SharedString> {
+        if self.skip_close_confirmation {
+            None
+        } else {
+            Some("Close this terminal?".into())
+        }
+    }
+
     fn as_searchable(
         &self,
         handle: &Entity<Self>,
@@ -1666,7 +2163,7 @@ impl Item for TerminalView {
     fn added_to_workspace(
         &mut self,
         workspace: &mut Workspace,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.terminal().read(cx).task().is_none() {
@@ -1682,6 +2179,32 @@ impl Item for TerminalView {
                 .detach();
             }
             self.workspace_id = workspace.database_id();
+
+            let new_terminal_item_id = cx.entity_id().as_u64() as workspace::ItemId;
+            let restored_terminal_item_id = self.restored_terminal_item_id.take();
+            if let Some(workspace_id) = self.workspace_id {
+                if let Some(restored_terminal_item_id) = restored_terminal_item_id
+                    .filter(|old_item_id| *old_item_id != new_terminal_item_id)
+                {
+                    cx.spawn_in(window, async move |this, cx| {
+                        cx.background_spawn(rekey_terminal_planning_note_terminal_item(
+                            workspace_id,
+                            restored_terminal_item_id,
+                            new_terminal_item_id,
+                        ))
+                        .await?;
+                        this.update_in(cx, |this, window, cx| {
+                            this.restore_planning_note_if_needed(window, cx);
+                        })?;
+                        anyhow::Ok(())
+                    })
+                    .detach_and_log_err(cx);
+                } else {
+                    cx.defer_in(window, |this, window, cx| {
+                        this.restore_planning_note_if_needed(window, cx);
+                    });
+                }
+            }
         }
     }
 
@@ -1701,7 +2224,12 @@ impl SerializableItem for TerminalView {
         _window: &mut Window,
         cx: &mut App,
     ) -> Task<anyhow::Result<()>> {
-        delete_unloaded_items(alive_items, workspace_id, "terminals", &TERMINAL_DB, cx)
+        let terminal_cleanup =
+            delete_unloaded_items(alive_items.clone(), workspace_id, "terminals", &TERMINAL_DB, cx);
+        cx.spawn(async move |_| {
+            delete_unloaded_terminal_planning_notes(workspace_id, alive_items).await?;
+            terminal_cleanup.await
+        })
     }
 
     fn serialize(
@@ -1794,6 +2322,7 @@ impl SerializableItem for TerminalView {
                     if custom_title.is_some() {
                         view.custom_title = custom_title;
                     }
+                    view.restored_terminal_item_id = Some(item_id);
                     view
                 })
             })
@@ -2304,6 +2833,108 @@ mod tests {
         });
     }
 
+    fn drain_test_tasks(cx: &mut TestAppContext) {
+        for _ in 0..5 {
+            cx.run_until_parked();
+            cx.background_executor.run_until_parked();
+        }
+    }
+
+    async fn add_terminal_view_to_workspace(
+        project: Entity<Project>,
+        workspace: Entity<Workspace>,
+        window_handle: gpui::WindowHandle<MultiWorkspace>,
+        cx: &mut TestAppContext,
+    ) -> Entity<TerminalView> {
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+        let terminal = project
+            .update(cx, |project, cx| project.create_terminal_shell(None, cx))
+            .await
+            .unwrap();
+
+        let terminal_view = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let terminal_view = cx.new(|cx| {
+                    TerminalView::new(
+                        terminal,
+                        workspace.downgrade(),
+                        workspace.read(cx).database_id(),
+                        project.downgrade(),
+                        window,
+                        cx,
+                    )
+                });
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(terminal_view.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+                terminal_view
+            })
+            .unwrap();
+
+        drain_test_tasks(cx);
+        window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                assert!(workspace.read(cx).pane_for(&terminal_view).is_some());
+            })
+            .unwrap();
+        let _ = workspace;
+        terminal_view
+    }
+
+    async fn add_terminal_view_to_pane(
+        project: Entity<Project>,
+        workspace: Entity<Workspace>,
+        pane: Entity<Pane>,
+        window_handle: gpui::WindowHandle<MultiWorkspace>,
+        cx: &mut TestAppContext,
+    ) -> Entity<TerminalView> {
+        let terminal = project
+            .update(cx, |project, cx| project.create_terminal_shell(None, cx))
+            .await
+            .unwrap();
+
+        let terminal_view = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let terminal_view = cx.new(|cx| {
+                    TerminalView::new(
+                        terminal,
+                        workspace.downgrade(),
+                        workspace.read(cx).database_id(),
+                        project.downgrade(),
+                        window,
+                        cx,
+                    )
+                });
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item(
+                        pane.clone(),
+                        Box::new(terminal_view.clone()),
+                        None,
+                        true,
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+                terminal_view
+            })
+            .unwrap();
+
+        drain_test_tasks(cx);
+        let _ = workspace;
+        terminal_view
+    }
+
     // Terminal drag/drop test
 
     #[gpui::test]
@@ -2482,6 +3113,556 @@ mod tests {
     }
 
     // Terminal rename tests
+
+    #[gpui::test]
+    async fn test_attach_planning_note_creates_markdown_editor_and_split(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        let (project, workspace, window_handle) = init_test_with_window(cx).await;
+        let terminal_view =
+            add_terminal_view_to_workspace(project.clone(), workspace.clone(), window_handle, cx)
+                .await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        let markdown = language_registry.language_for_name("Markdown").await.ok();
+        let markdown_available = markdown.is_some();
+        let buffer = project
+            .update(cx, |project, cx| project.create_buffer(markdown, true, cx))
+            .await
+            .unwrap();
+
+        let editor = window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                let multibuffer =
+                    cx.new(|cx| MultiBuffer::singleton(buffer, cx).with_title(PLANNING_NOTE_TITLE.into()));
+                cx.new(|cx| Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx))
+            })
+            .unwrap();
+
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    let working_directory = terminal_view.planning_note_context_path(cx).unwrap();
+                    terminal_view.add_planning_note_to_workspace(editor.clone(), true, window, cx);
+                    terminal_view
+                        .attach_planning_note(editor.clone(), working_directory, cx)
+                        .unwrap();
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let editors: Vec<_> = workspace.read(cx).items_of_type::<Editor>(cx).collect();
+
+                assert_eq!(workspace.read(cx).panes().len(), 2);
+                assert_eq!(editors.len(), 1);
+
+                let editor = &editors[0];
+                assert_eq!(editor.read(cx).tab_content_text(0, cx).as_ref(), PLANNING_NOTE_TITLE);
+
+                let language_name = editor
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .as_singleton()
+                    .and_then(|buffer| buffer.read(cx).language())
+                    .map(|language| language.name().as_ref().to_string());
+                if markdown_available {
+                    assert_eq!(language_name.as_deref(), Some("Markdown"));
+                }
+
+                assert_eq!(
+                    terminal_view
+                        .read(cx)
+                        .current_attached_planning_note(cx)
+                        .unwrap()
+                        .entity_id(),
+                    editor.entity_id()
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_add_planning_note_to_workspace_reuses_existing_editor_for_same_terminal_context(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        let (project, workspace, window_handle) = init_test_with_window(cx).await;
+        let terminal_view =
+            add_terminal_view_to_workspace(project.clone(), workspace.clone(), window_handle, cx)
+                .await;
+        let buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer("", None, true, cx)
+        });
+        let editor = window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                let multibuffer =
+                    cx.new(|cx| MultiBuffer::singleton(buffer, cx).with_title(PLANNING_NOTE_TITLE.into()));
+                cx.new(|cx| Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx))
+            })
+            .unwrap();
+
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    let working_directory = terminal_view.planning_note_context_path(cx).unwrap();
+                    terminal_view.add_planning_note_to_workspace(editor.clone(), true, window, cx);
+                    terminal_view
+                        .attach_planning_note(editor.clone(), working_directory, cx)
+                        .unwrap();
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.add_planning_note_to_workspace(editor.clone(), true, window, cx);
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let editors: Vec<_> = workspace.read(cx).items_of_type::<Editor>(cx).collect();
+
+                assert_eq!(workspace.read(cx).panes().len(), 2);
+                assert_eq!(editors.len(), 1);
+                assert_eq!(editors[0].entity_id(), editor.entity_id());
+                assert_eq!(
+                    terminal_view
+                        .read(cx)
+                        .current_attached_planning_note(cx)
+                        .unwrap()
+                        .entity_id(),
+                    editor.entity_id()
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_open_planning_note_while_creation_is_in_flight_does_not_create_duplicate(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        let (project, workspace, window_handle) = init_test_with_window(cx).await;
+        let terminal_view =
+            add_terminal_view_to_workspace(project.clone(), workspace.clone(), window_handle, cx)
+                .await;
+
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.open_planning_note(&OpenPlanningNote, window, cx);
+                    terminal_view.open_planning_note(&OpenPlanningNote, window, cx);
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let editors: Vec<_> = workspace.read(cx).items_of_type::<Editor>(cx).collect();
+
+                assert_eq!(workspace.read(cx).panes().len(), 2);
+                assert_eq!(editors.len(), 1);
+                assert_eq!(
+                    terminal_view
+                        .read(cx)
+                        .current_attached_planning_note(cx)
+                        .unwrap()
+                        .entity_id(),
+                    editors[0].entity_id()
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_switching_between_terminals_reuses_each_attached_planning_note(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        let (project, workspace, window_handle) = init_test_with_window(cx).await;
+        let terminal_a =
+            add_terminal_view_to_workspace(project.clone(), workspace.clone(), window_handle, cx)
+                .await;
+
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                terminal_a.update(cx, |terminal_view, cx| {
+                    terminal_view.open_planning_note(&OpenPlanningNote, window, cx);
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        let source_pane = window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let planning_note = terminal_a
+                    .read(cx)
+                    .current_attached_planning_note(cx)
+                    .unwrap();
+                planning_note.update(cx, |editor, cx| {
+                    if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                        buffer.update(cx, |buffer, cx| buffer.set_text("plan a", cx));
+                    }
+                });
+                workspace.read(cx).pane_for(&terminal_a).unwrap()
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        let terminal_b = add_terminal_view_to_pane(
+            project.clone(),
+            workspace.clone(),
+            source_pane.clone(),
+            window_handle,
+            cx,
+        )
+        .await;
+
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                terminal_b.update(cx, |terminal_view, cx| {
+                    terminal_view.open_planning_note(&OpenPlanningNote, window, cx);
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        window_handle
+            .update(cx, |_multi_workspace, _window, cx| {
+                let planning_note = terminal_b
+                    .read(cx)
+                    .current_attached_planning_note(cx)
+                    .unwrap();
+                planning_note.update(cx, |editor, cx| {
+                    if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                        buffer.update(cx, |buffer, cx| buffer.set_text("plan b", cx));
+                    }
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        for (terminal, expected_text, expected_index) in [
+            (&terminal_a, "plan a", 0_usize),
+            (&terminal_b, "plan b", 1_usize),
+            (&terminal_a, "plan a", 0_usize),
+        ] {
+            window_handle
+                .update(cx, |_multi_workspace, window, cx| {
+                    source_pane.update(cx, |pane, cx| {
+                        pane.activate_item(expected_index, true, true, window, cx);
+                    });
+                })
+                .unwrap();
+            drain_test_tasks(cx);
+
+            window_handle
+                .update(cx, |multi_workspace, _window, cx| {
+                    let workspace = multi_workspace.workspace().clone();
+                    let planning_note = terminal
+                        .read(cx)
+                        .current_attached_planning_note(cx)
+                        .unwrap();
+
+                    assert_eq!(workspace.read(cx).panes().len(), 2);
+                    assert_eq!(workspace.read(cx).items_of_type::<Editor>(cx).count(), 1);
+                    assert_eq!(
+                        planning_note
+                            .read(cx)
+                            .buffer()
+                            .read(cx)
+                            .as_singleton()
+                            .unwrap()
+                            .read(cx)
+                            .text(),
+                        expected_text
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    async fn test_planning_note_hides_with_terminal_tab_switch_and_restores_on_return(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        let (project, workspace, window_handle) = init_test_with_window(cx).await;
+        let terminal_view =
+            add_terminal_view_to_workspace(project.clone(), workspace.clone(), window_handle, cx)
+                .await;
+
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.open_planning_note(&OpenPlanningNote, window, cx);
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        let source_pane = window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let planning_note = terminal_view
+                    .read(cx)
+                    .current_attached_planning_note(cx)
+                    .unwrap();
+                planning_note.update(cx, |editor, cx| {
+                    if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                        buffer.update(cx, |buffer, cx| buffer.set_text("plan text", cx));
+                    }
+                });
+                workspace.read(cx).pane_for(&terminal_view).unwrap()
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        let _second_terminal = add_terminal_view_to_pane(
+            project.clone(),
+            workspace.clone(),
+            source_pane.clone(),
+            window_handle,
+            cx,
+        )
+        .await;
+
+        window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                assert_eq!(workspace.read(cx).panes().len(), 1);
+                assert_eq!(workspace.read(cx).items_of_type::<Editor>(cx).count(), 0);
+                assert!(
+                    terminal_view
+                        .read(cx)
+                        .current_attached_planning_note(cx)
+                        .is_none()
+                );
+            })
+            .unwrap();
+
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                source_pane.update(cx, |pane, cx| {
+                    pane.activate_item(0, true, true, window, cx);
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let planning_note = terminal_view
+                    .read(cx)
+                    .current_attached_planning_note(cx)
+                    .unwrap();
+
+                assert_eq!(workspace.read(cx).panes().len(), 2);
+                assert_eq!(workspace.read(cx).items_of_type::<Editor>(cx).count(), 1);
+                assert_eq!(
+                    planning_note
+                        .read(cx)
+                        .buffer()
+                        .read(cx)
+                        .as_singleton()
+                        .unwrap()
+                        .read(cx)
+                        .text(),
+                    "plan text"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_closing_planning_note_detaches_it_without_reopening(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        let (project, workspace, window_handle) = init_test_with_window(cx).await;
+        let terminal_view =
+            add_terminal_view_to_workspace(project.clone(), workspace.clone(), window_handle, cx)
+                .await;
+
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.open_planning_note(&OpenPlanningNote, window, cx);
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        let (workspace_id, terminal_item_id, working_directory, close_task) = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let workspace_id = workspace.read(cx).database_id().unwrap();
+                let terminal_item_id = terminal_view.entity_id().as_u64() as workspace::ItemId;
+                let working_directory = terminal_view
+                    .read(cx)
+                    .planning_note_context_path(cx)
+                    .unwrap();
+                let planning_note = terminal_view
+                    .read(cx)
+                    .current_attached_planning_note(cx)
+                    .unwrap();
+                let note_pane = workspace.read(cx).pane_for(&planning_note).unwrap();
+                let close_task = note_pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(
+                        planning_note.entity_id(),
+                        workspace::SaveIntent::Skip,
+                        window,
+                        cx,
+                    )
+                });
+
+                (workspace_id, terminal_item_id, working_directory, close_task)
+            })
+            .unwrap();
+        close_task.await.unwrap();
+        drain_test_tasks(cx);
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+
+                assert_eq!(workspace.read(cx).items_of_type::<Editor>(cx).count(), 0);
+                assert!(
+                    terminal_view
+                        .read(cx)
+                        .current_attached_planning_note(cx)
+                        .is_none()
+                );
+                assert!(
+                    get_terminal_planning_note(
+                        workspace_id,
+                        terminal_item_id,
+                        working_directory.as_path(),
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.restore_planning_note_if_needed(window, cx);
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+
+                assert_eq!(workspace.read(cx).items_of_type::<Editor>(cx).count(), 0);
+                assert!(
+                    terminal_view
+                        .read(cx)
+                        .current_attached_planning_note(cx)
+                        .is_none()
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_manual_terminal_close_shows_confirmation_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        let (project, workspace, window_handle) = init_test_with_window(cx).await;
+        let terminal_view =
+            add_terminal_view_to_workspace(project.clone(), workspace.clone(), window_handle, cx)
+                .await;
+
+        let close_task = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let pane = workspace.read(cx).pane_for(&terminal_view).unwrap();
+                pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(
+                        terminal_view.entity_id(),
+                        workspace::SaveIntent::Close,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        assert!(cx.has_pending_prompt());
+        assert_eq!(
+            cx.pending_prompt().unwrap().0,
+            "Close this terminal?"
+        );
+
+        cx.simulate_prompt_answer("Close");
+        close_task.await.unwrap();
+        drain_test_tasks(cx);
+
+        window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                assert!(workspace.read(cx).pane_for(&terminal_view).is_none());
+                assert_eq!(workspace.read(cx).panes().len(), 1);
+                assert_eq!(workspace.read(cx).active_pane().read(cx).items_len(), 0);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_terminal_exit_closes_without_confirmation_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        let (project, workspace, window_handle) = init_test_with_window(cx).await;
+        let terminal_view =
+            add_terminal_view_to_workspace(project.clone(), workspace.clone(), window_handle, cx)
+                .await;
+        let terminal = terminal_view.read_with(cx, |terminal_view, _| terminal_view.terminal().clone());
+
+        window_handle
+            .update(cx, |_multi_workspace, _window, cx| {
+                terminal.update(cx, |_terminal, cx| {
+                    cx.emit(Event::CloseTerminal);
+                });
+            })
+            .unwrap();
+        drain_test_tasks(cx);
+
+        assert!(!cx.has_pending_prompt());
+
+        window_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                assert!(workspace.read(cx).pane_for(&terminal_view).is_none());
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     async fn test_custom_title_initially_none(cx: &mut TestAppContext) {

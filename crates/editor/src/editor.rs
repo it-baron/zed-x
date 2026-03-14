@@ -75,6 +75,12 @@ pub use items::MAX_TAB_TITLE_LEN;
 pub use linked_editing_ranges::LinkedEdits;
 pub use lsp::CompletionContext;
 pub use lsp_ext::lsp_tasks;
+pub use persistence::{
+    delete_terminal_planning_note, delete_unloaded_terminal_planning_notes,
+    get_terminal_planning_note,
+    rekey_terminal_planning_note_item, rekey_terminal_planning_note_terminal_item,
+    save_terminal_planning_note,
+};
 pub use multi_buffer::{
     Anchor, AnchorRangeExt, BufferOffset, ExcerptId, ExcerptRange, MBTextSummary, MultiBuffer,
     MultiBufferOffset, MultiBufferOffsetUtf16, MultiBufferSnapshot, PathKey, RowInfo, ToOffset,
@@ -1248,6 +1254,7 @@ pub struct Editor {
     git_blame_inline_enabled: bool,
     render_diff_hunk_controls: RenderDiffHunkControlsFn,
     buffer_serialization: Option<BufferSerialization>,
+    restored_item_id: Option<ItemId>,
     show_selection_menu: Option<bool>,
     blame: Option<Entity<GitBlame>>,
     blame_subscription: Option<Subscription>,
@@ -2490,6 +2497,7 @@ impl Editor {
                         .restore_unsaved_buffers,
                 )
             }),
+            restored_item_id: None,
             blame: None,
             blame_subscription: None,
 
@@ -3389,6 +3397,14 @@ impl Editor {
                     .restore_unsaved_buffers,
             )
         })
+    }
+
+    pub fn restored_item_id(&self) -> Option<ItemId> {
+        self.restored_item_id
+    }
+
+    pub(crate) fn set_restored_item_id(&mut self, item_id: ItemId) {
+        self.restored_item_id = Some(item_id);
     }
 
     fn should_serialize_buffer(&self) -> bool {

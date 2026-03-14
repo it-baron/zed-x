@@ -1,12 +1,12 @@
 [package]
-description = "The fast, collaborative code editor."
+description = "Zed-X: a fast, collaborative code editor. Fork of Zed by ccbox.app."
 edition.workspace = true
-name = "zed"
+name = "zedx"
 version = "0.229.0"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Zed Team <hi@zed.dev>"]
-default-run = "zed"
+default-run = "zedx"
 
 [lints]
 workspace = true
@@ -52,7 +52,7 @@ visual-tests = [
 ]
 
 [[bin]]
-name = "zed"
+name = "zedx"
 path = "src/main.rs"
 
 [[bin]]
@@ -260,35 +260,67 @@ repl = { workspace = true, features = ["test-support"] }
 
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
-identifier = "dev.zed.Zed-Dev"
-name = "Zed Dev"
+identifier = "app.ccbox.ZedX-Dev"
+name = "ZedX Dev"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["zed-x"]
+
+[package.metadata.bundle-dev.bin.zedx]
+icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
+identifier = "app.ccbox.ZedX-Dev"
+name = "ZedX Dev"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
+osx_url_schemes = ["zed-x"]
 
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
-identifier = "dev.zed.Zed-Nightly"
-name = "Zed Nightly"
+identifier = "app.ccbox.ZedX-Nightly"
+name = "ZedX Nightly"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["zed-x"]
+
+[package.metadata.bundle-nightly.bin.zedx]
+icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
+identifier = "app.ccbox.ZedX-Nightly"
+name = "ZedX Nightly"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
+osx_url_schemes = ["zed-x"]
 
 [package.metadata.bundle-preview]
 icon = ["resources/app-icon-preview@2x.png", "resources/app-icon-preview.png"]
-identifier = "dev.zed.Zed-Preview"
-name = "Zed Preview"
+identifier = "app.ccbox.ZedX-Preview"
+name = "ZedX Preview"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["zed-x"]
+
+[package.metadata.bundle-preview.bin.zedx]
+icon = ["resources/app-icon-preview@2x.png", "resources/app-icon-preview.png"]
+identifier = "app.ccbox.ZedX-Preview"
+name = "ZedX Preview"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
+osx_url_schemes = ["zed-x"]
 
 [package.metadata.bundle-stable]
 icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
-identifier = "dev.zed.Zed"
-name = "Zed"
+identifier = "app.ccbox.ZedX"
+name = "ZedX"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["zed-x"]
+
+[package.metadata.bundle-stable.bin.zedx]
+icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
+identifier = "app.ccbox.ZedX"
+name = "ZedX"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
+osx_url_schemes = ["zed-x"]
 
 [package.metadata.cargo-machete]
 ignored = ["profiling", "zstd", "tracing"]

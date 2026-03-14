@@ -223,6 +223,18 @@ impl Domain for EditorDb {
                 PRIMARY KEY(workspace_id, path, start)
             );
         ),
+        sql! (
+            CREATE TABLE terminal_planning_notes (
+                workspace_id INTEGER NOT NULL,
+                terminal_item_id INTEGER NOT NULL,
+                working_directory_path TEXT NOT NULL,
+                note_item_id INTEGER NOT NULL,
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                    ON DELETE CASCADE
+                    ON UPDATE CASCADE,
+                PRIMARY KEY(workspace_id, terminal_item_id, working_directory_path)
+            ) STRICT;
+        ),
     ];
 }
 
@@ -319,6 +331,28 @@ impl EditorDb {
         }
     }
 
+    query! {
+        pub fn get_terminal_planning_note(
+            workspace_id: WorkspaceId,
+            terminal_item_id: ItemId,
+            working_directory_path: String
+        ) -> Result<Option<ItemId>> {
+            SELECT note_item_id
+            FROM terminal_planning_notes
+            WHERE workspace_id = ?1
+                AND terminal_item_id = ?2
+                AND working_directory_path = ?3
+        }
+    }
+
+    query! {
+        pub fn terminal_planning_note_item_ids(workspace_id: WorkspaceId) -> Result<Vec<ItemId>> {
+            SELECT DISTINCT note_item_id
+            FROM terminal_planning_notes
+            WHERE workspace_id = ?
+        }
+    }
+
     pub async fn save_editor_selections(
         &self,
         editor_id: ItemId,
@@ -408,6 +442,196 @@ VALUES {placeholders};
         })
         .await
     }
+
+    pub async fn save_terminal_planning_note(
+        &self,
+        workspace_id: WorkspaceId,
+        terminal_item_id: ItemId,
+        working_directory_path: PathBuf,
+        note_item_id: ItemId,
+    ) -> Result<()> {
+        let working_directory_path = working_directory_path.to_string_lossy().into_owned();
+        self.write(move |conn| {
+            conn.exec_bound(sql!(
+                INSERT INTO terminal_planning_notes (
+                    workspace_id,
+                    terminal_item_id,
+                    working_directory_path,
+                    note_item_id
+                )
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT (workspace_id, terminal_item_id, working_directory_path)
+                DO UPDATE SET note_item_id = excluded.note_item_id;
+            ))?(
+                (
+                    workspace_id,
+                    terminal_item_id,
+                    working_directory_path,
+                    note_item_id,
+                ),
+            )
+        })
+        .await
+    }
+
+    pub async fn delete_terminal_planning_note(
+        &self,
+        workspace_id: WorkspaceId,
+        terminal_item_id: ItemId,
+        working_directory_path: PathBuf,
+    ) -> Result<()> {
+        let working_directory_path = working_directory_path.to_string_lossy().into_owned();
+        self.write(move |conn| {
+            conn.exec_bound(sql!(
+                DELETE FROM terminal_planning_notes
+                WHERE workspace_id = ?1
+                    AND terminal_item_id = ?2
+                    AND working_directory_path = ?3;
+            ))?((workspace_id, terminal_item_id, working_directory_path))
+        })
+        .await
+    }
+
+    pub async fn rekey_terminal_planning_note_terminal_item(
+        &self,
+        workspace_id: WorkspaceId,
+        old_terminal_item_id: ItemId,
+        new_terminal_item_id: ItemId,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            conn.exec_bound(sql!(
+                INSERT INTO terminal_planning_notes (
+                    workspace_id,
+                    terminal_item_id,
+                    working_directory_path,
+                    note_item_id
+                )
+                SELECT
+                    workspace_id,
+                    ?3,
+                    working_directory_path,
+                    note_item_id
+                FROM terminal_planning_notes
+                WHERE workspace_id = ?1 AND terminal_item_id = ?2
+                ON CONFLICT (workspace_id, terminal_item_id, working_directory_path)
+                DO UPDATE SET note_item_id = excluded.note_item_id;
+            ))?((workspace_id, old_terminal_item_id, new_terminal_item_id))?;
+
+            conn.exec_bound(sql!(
+                DELETE FROM terminal_planning_notes
+                WHERE workspace_id = ?1 AND terminal_item_id = ?2;
+            ))?((workspace_id, old_terminal_item_id))
+        })
+        .await
+    }
+
+    query! {
+        pub async fn rekey_terminal_planning_note_item(
+            workspace_id: WorkspaceId,
+            old_note_item_id: ItemId,
+            new_note_item_id: ItemId
+        ) -> Result<()> {
+            UPDATE terminal_planning_notes
+            SET note_item_id = ?3
+            WHERE workspace_id = ?1 AND note_item_id = ?2
+        }
+    }
+
+    pub async fn delete_unloaded_terminal_planning_notes(
+        &self,
+        workspace_id: WorkspaceId,
+        alive_terminal_ids: Vec<ItemId>,
+    ) -> Result<()> {
+        let placeholders = alive_terminal_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let query = if alive_terminal_ids.is_empty() {
+            "DELETE FROM terminal_planning_notes WHERE workspace_id = ?1".to_string()
+        } else {
+            format!(
+                "DELETE FROM terminal_planning_notes WHERE workspace_id = ?1 AND terminal_item_id NOT IN ({placeholders})"
+            )
+        };
+
+        self.write(move |conn| {
+            let mut statement = Statement::prepare(conn, query)?;
+            let mut next_index = statement.bind(&workspace_id, 1)?;
+            for item_id in alive_terminal_ids {
+                next_index = statement.bind(&item_id, next_index)?;
+            }
+            statement.exec()
+        })
+        .await
+    }
+}
+
+pub fn get_terminal_planning_note(
+    workspace_id: WorkspaceId,
+    terminal_item_id: ItemId,
+    working_directory_path: &Path,
+) -> Result<Option<ItemId>> {
+    DB.get_terminal_planning_note(
+        workspace_id,
+        terminal_item_id,
+        working_directory_path.to_string_lossy().into_owned(),
+    )
+}
+
+pub async fn save_terminal_planning_note(
+    workspace_id: WorkspaceId,
+    terminal_item_id: ItemId,
+    working_directory_path: PathBuf,
+    note_item_id: ItemId,
+) -> Result<()> {
+    DB.save_terminal_planning_note(
+        workspace_id,
+        terminal_item_id,
+        working_directory_path,
+        note_item_id,
+    )
+    .await
+}
+
+pub async fn delete_terminal_planning_note(
+    workspace_id: WorkspaceId,
+    terminal_item_id: ItemId,
+    working_directory_path: PathBuf,
+) -> Result<()> {
+    DB.delete_terminal_planning_note(workspace_id, terminal_item_id, working_directory_path)
+        .await
+}
+
+pub async fn rekey_terminal_planning_note_terminal_item(
+    workspace_id: WorkspaceId,
+    old_terminal_item_id: ItemId,
+    new_terminal_item_id: ItemId,
+) -> Result<()> {
+    DB.rekey_terminal_planning_note_terminal_item(
+        workspace_id,
+        old_terminal_item_id,
+        new_terminal_item_id,
+    )
+    .await
+}
+
+pub async fn rekey_terminal_planning_note_item(
+    workspace_id: WorkspaceId,
+    old_note_item_id: ItemId,
+    new_note_item_id: ItemId,
+) -> Result<()> {
+    DB.rekey_terminal_planning_note_item(workspace_id, old_note_item_id, new_note_item_id)
+        .await
+}
+
+pub async fn delete_unloaded_terminal_planning_notes(
+    workspace_id: WorkspaceId,
+    alive_terminal_ids: Vec<ItemId>,
+) -> Result<()> {
+    DB.delete_unloaded_terminal_planning_notes(workspace_id, alive_terminal_ids)
+        .await
 }
 
 #[cfg(test)]
@@ -596,5 +820,91 @@ mod tests {
         assert_eq!(retrieved_b.len(), 1);
         assert_eq!(retrieved_a[0].0, 10); // file_a's fold
         assert_eq!(retrieved_b[0].0, 30); // file_b's fold
+    }
+
+    #[gpui::test]
+    async fn test_terminal_planning_notes_round_trip_and_rekey() {
+        let workspace_id = workspace::WORKSPACE_DB.next_id().await.unwrap();
+        let cwd = PathBuf::from("/tmp/project-a");
+
+        DB.save_terminal_planning_note(workspace_id, 11, cwd.clone(), 101)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            DB.get_terminal_planning_note(workspace_id, 11, cwd.to_string_lossy().into_owned())
+                .unwrap(),
+            Some(101)
+        );
+        assert_eq!(
+            DB.terminal_planning_note_item_ids(workspace_id).unwrap(),
+            vec![101]
+        );
+
+        DB.rekey_terminal_planning_note_terminal_item(workspace_id, 11, 22)
+            .await
+            .unwrap();
+        assert_eq!(
+            DB.get_terminal_planning_note(workspace_id, 22, cwd.to_string_lossy().into_owned())
+                .unwrap(),
+            Some(101)
+        );
+        assert_eq!(
+            DB.get_terminal_planning_note(workspace_id, 11, cwd.to_string_lossy().into_owned())
+                .unwrap(),
+            None
+        );
+
+        DB.rekey_terminal_planning_note_item(workspace_id, 101, 202)
+            .await
+            .unwrap();
+        assert_eq!(
+            DB.get_terminal_planning_note(workspace_id, 22, cwd.to_string_lossy().into_owned())
+                .unwrap(),
+            Some(202)
+        );
+        assert_eq!(
+            DB.terminal_planning_note_item_ids(workspace_id).unwrap(),
+            vec![202]
+        );
+
+        DB.delete_terminal_planning_note(workspace_id, 22, cwd.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            DB.get_terminal_planning_note(workspace_id, 22, cwd.to_string_lossy().into_owned())
+                .unwrap(),
+            None
+        );
+        assert!(DB.terminal_planning_note_item_ids(workspace_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_delete_unloaded_terminal_planning_notes() {
+        let workspace_id = workspace::WORKSPACE_DB.next_id().await.unwrap();
+
+        DB.save_terminal_planning_note(workspace_id, 1, PathBuf::from("/tmp/a"), 10)
+            .await
+            .unwrap();
+        DB.save_terminal_planning_note(workspace_id, 2, PathBuf::from("/tmp/b"), 20)
+            .await
+            .unwrap();
+
+        DB.delete_unloaded_terminal_planning_notes(workspace_id, vec![2])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            DB.terminal_planning_note_item_ids(workspace_id).unwrap(),
+            vec![20]
+        );
+
+        DB.delete_unloaded_terminal_planning_notes(workspace_id, Vec::new())
+            .await
+            .unwrap();
+
+        assert!(DB.terminal_planning_note_item_ids(workspace_id).unwrap().is_empty());
     }
 }

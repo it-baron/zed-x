@@ -86,8 +86,8 @@ script/generate-licenses
 
 rustup target add $target_triple
 
-echo "Compiling zed binaries"
-cargo build ${build_flag} --package zed --package cli --target $target_triple
+echo "Compiling zedx binaries"
+cargo build ${build_flag} --package zedx --package cli --target $target_triple
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
 cargo build ${build_flag} --package remote_server --target $target_triple
@@ -100,11 +100,12 @@ sed \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
+app_path=$(cargo bundle ${build_flag} --bin zedx --target $target_triple --select-workspace-root | xargs)
 
 mv Cargo.toml.backup Cargo.toml
 popd
 echo "Bundled ${app_path}"
+installed_app_path="${app_path}"
 
 # DocumentTypes.plist references CFBundleTypeIconFile "Document", so the bundle must contain Document.icns.
 # We use the app icon as a placeholder document icon for now.
@@ -188,6 +189,40 @@ function download_git() {
     rm -rf "$tmp_dir"
 }
 
+function strip_binary_for_local_install() {
+    local binary_path=$1
+
+    if [ "$local_install" != true ] || [[ ! -f "$binary_path" ]]; then
+        return 0
+    fi
+
+    if ! command -v strip >/dev/null 2>&1; then
+        echo "Skipping debug symbol stripping for $binary_path because strip is unavailable"
+        return 0
+    fi
+
+    # Keep the local debug build install smaller by removing debug symbols from the bundled executables.
+    strip -S "$binary_path"
+}
+
+function prepare_local_install_bundle() {
+    local info_plist_path="${app_path}/Contents/Info.plist"
+
+    if [ "$local_install" != true ] || [[ ! -f "$info_plist_path" ]]; then
+        return 0
+    fi
+
+    if [ "$channel" = "dev" ]; then
+        /usr/libexec/PlistBuddy -c "Set :CFBundleName ZedX" "$info_plist_path"
+        if /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$info_plist_path" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ZedX" "$info_plist_path"
+        else
+            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string ZedX" "$info_plist_path"
+        fi
+    fi
+
+}
+
 function sign_app_binaries() {
     rm -rf "${app_path}/Contents/Frameworks"
     mkdir -p "${app_path}/Contents/Frameworks"
@@ -197,13 +232,14 @@ function sign_app_binaries() {
 
     # Note: The app identifier for our development builds is the same as the app identifier for nightly.
     cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
+    prepare_local_install_bundle
 
     if [[ $can_code_sign = true ]]; then
         echo "Code signing binaries"
         # sequence of codesign commands modeled after this example: https://developer.apple.com/forums/thread/701514
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/cli" -v
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/git" -v
-        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/zed" -v
+        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/zedx" -v
         /usr/bin/codesign --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}" -v
     else
         echo "One or more of the following variables are missing: MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD, APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, APPLE_NOTARIZATION_ISSUER_ID"
@@ -223,14 +259,33 @@ function sign_app_binaries() {
     fi
 
     bundle_name=$(basename "$app_path")
+    install_bundle_name="$bundle_name"
+    if [ "$local_install" = true ] && [ "$channel" = "dev" ]; then
+        install_bundle_name="ZedX.app"
+    fi
+    install_bundle_path="/Applications/$install_bundle_name"
 
     if [ "$local_install" = true ]; then
-        rm -rf "/Applications/$bundle_name"
-        mv "$app_path" "/Applications/$bundle_name"
-        echo "Installed application bundle: /Applications/$bundle_name"
+        legacy_bundle_paths=("/Applications/zedx.app")
+        if [ "$bundle_name" != "$install_bundle_name" ]; then
+            legacy_bundle_paths+=("/Applications/$bundle_name")
+        fi
+
+        # Older local installs used cargo-bundle's generic zedx.app name, and the dev bundle name changed during rebranding.
+        for legacy_bundle_path in "${legacy_bundle_paths[@]}"; do
+            if [ "$legacy_bundle_path" != "$install_bundle_path" ] && [ -d "$legacy_bundle_path" ]; then
+                echo "Removing legacy application bundle: $legacy_bundle_path"
+                rm -rf "$legacy_bundle_path"
+            fi
+        done
+
+        rm -rf "$install_bundle_path"
+        mv "$app_path" "$install_bundle_path"
+        installed_app_path="$install_bundle_path"
+        echo "Installed application bundle: $install_bundle_path"
         if [ "$open_result" = true ]; then
-            echo "Opening /Applications/$bundle_name"
-            open "/Applications/$bundle_name"
+            echo "Opening $install_bundle_path"
+            open "$install_bundle_path"
         fi
     elif [ "$open_result" = true ]; then
         open "$app_path"
@@ -298,7 +353,7 @@ function upload_debug_symbols() {
     elif [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
         echo "Uploading zed debug symbols to sentry..."
         exe_path="target/${target_triple}/release/Zed"
-        if ! dsymutil --flat "target/${target_triple}/${target_dir}/zed" 2> target/dsymutil.log; then
+        if ! dsymutil --flat "target/${target_triple}/${target_dir}/zedx" 2> target/dsymutil.log; then
             echo "dsymutil failed"
             cat target/dsymutil.log
             exit 1
@@ -314,7 +369,7 @@ function upload_debug_symbols() {
         for attempt in 1 2 3; do
             echo "Sentry upload attempt $attempt..."
             if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-                "target/${target_triple}/${target_dir}/zed.dwarf" \
+                "target/${target_triple}/${target_dir}/zedx.dwarf" \
                 "target/${target_triple}/${target_dir}/remote_server.dwarf"; then
                 break
             else
@@ -332,9 +387,23 @@ function upload_debug_symbols() {
 
 upload_debug_symbols
 
-cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
+cp target/${target_triple}/${target_dir}/zedx "${app_path}/Contents/MacOS/zedx"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+strip_binary_for_local_install "${app_path}/Contents/MacOS/zedx"
+strip_binary_for_local_install "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+if [[ -f "target/$target_triple/${target_dir}/remote_server" ]]; then
+    sign_binary "target/$target_triple/${target_dir}/remote_server"
+    gzip -f --stdout --best target/$target_triple/${target_dir}/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+fi
+
+if [ "$local_install" = true ]; then
+    cli_path="${installed_app_path}/Contents/MacOS/cli"
+    link_path="/usr/local/bin/zedx"
+    if [[ -f "$cli_path" ]]; then
+        mkdir -p "$(dirname "$link_path")"
+        ln -sf "$cli_path" "$link_path"
+        echo "Installed CLI symlink: $link_path -> $cli_path"
+    fi
+fi

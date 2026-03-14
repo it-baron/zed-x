@@ -281,6 +281,11 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     fn can_save_as(&self, _: &App) -> bool {
         false
     }
+    /// Returns a message to display in a confirmation dialog when closing this item.
+    /// If `None`, the item closes without confirmation (unless it's dirty and saveable).
+    fn close_message(&self, _cx: &App) -> Option<SharedString> {
+        None
+    }
     fn save(
         &mut self,
         _options: SaveOptions,
@@ -518,6 +523,7 @@ pub trait ItemHandle: 'static + Send {
     fn has_conflict(&self, cx: &App) -> bool;
     fn can_save(&self, cx: &App) -> bool;
     fn can_save_as(&self, cx: &App) -> bool;
+    fn close_message(&self, cx: &App) -> Option<SharedString>;
     fn save(
         &self,
         options: SaveOptions,
@@ -1035,6 +1041,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn can_save_as(&self, cx: &App) -> bool {
         self.read(cx).can_save_as(cx)
+    }
+
+    fn close_message(&self, cx: &App) -> Option<SharedString> {
+        self.read(cx).close_message(cx)
     }
 
     fn save(

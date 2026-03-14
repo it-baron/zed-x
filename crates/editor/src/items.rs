@@ -1133,10 +1133,20 @@ impl SerializableItem for Editor {
 
     fn cleanup(
         workspace_id: WorkspaceId,
-        alive_items: Vec<ItemId>,
+        mut alive_items: Vec<ItemId>,
         _window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<()>> {
+        let mapped_note_item_ids = match DB
+            .terminal_planning_note_item_ids(workspace_id)
+            .context("Failed to query terminal planning notes during editor cleanup")
+        {
+            Ok(item_ids) => item_ids,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        alive_items.extend(mapped_note_item_ids);
+        alive_items.sort_unstable();
+        alive_items.dedup();
         workspace::delete_unloaded_items(alive_items, workspace_id, "editors", &DB, cx)
     }
 
@@ -1222,6 +1232,7 @@ impl SerializableItem for Editor {
                         cx.new(|cx| {
                             let mut editor = Editor::for_buffer(buffer, Some(project), window, cx);
 
+                            editor.set_restored_item_id(item_id);
                             editor.read_metadata_from_db(item_id, workspace_id, window, cx);
                             editor
                         })
@@ -1260,6 +1271,7 @@ impl SerializableItem for Editor {
                                 let mut editor =
                                     Editor::for_buffer(buffer, Some(project), window, cx);
 
+                                editor.set_restored_item_id(item_id);
                                 editor.read_metadata_from_db(item_id, workspace_id, window, cx);
                                 editor
                             })
@@ -1299,6 +1311,7 @@ impl SerializableItem for Editor {
                             }
 
                             editor.update_in(cx, |editor, window, cx| {
+                                editor.set_restored_item_id(item_id);
                                 editor.read_metadata_from_db(item_id, workspace_id, window, cx);
                             })?;
                             Ok(editor)
@@ -1320,6 +1333,7 @@ impl SerializableItem for Editor {
                     cx.new(|cx| {
                         let mut editor = Editor::for_buffer(buffer, Some(project), window, cx);
 
+                        editor.set_restored_item_id(item_id);
                         editor.read_metadata_from_db(item_id, workspace_id, window, cx);
                         editor
                     })

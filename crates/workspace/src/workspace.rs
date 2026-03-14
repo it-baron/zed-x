@@ -1546,7 +1546,7 @@ impl Workspace {
                 project.clone(),
                 pane_history_timestamp.clone(),
                 None,
-                NewFile.boxed_clone(),
+                NewCenterTerminal::default().boxed_clone(),
                 true,
                 window,
                 cx,
@@ -1992,6 +1992,7 @@ impl Workspace {
                     });
                 })
                 .log_err();
+
             Ok(OpenResult {
                 window,
                 workspace,
@@ -3967,7 +3968,7 @@ impl Workspace {
                 self.project.clone(),
                 self.pane_history_timestamp.clone(),
                 None,
-                NewFile.boxed_clone(),
+                NewCenterTerminal::default().boxed_clone(),
                 true,
                 window,
                 cx,

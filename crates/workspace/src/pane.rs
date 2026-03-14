@@ -1996,6 +1996,28 @@ impl Pane {
                     }
                 }
 
+                // Show close confirmation for items that provide a close_message
+                // (e.g., terminals) when not already handled by the save flow.
+                if should_close && !should_save && save_intent == SaveIntent::Close {
+                    if let Some(message) =
+                        cx.update(|_window, cx| item_to_close.close_message(cx))?
+                    {
+                        let answer = pane.update_in(cx, |_, window, cx| {
+                            window.prompt(
+                                PromptLevel::Warning,
+                                &message,
+                                None,
+                                &["Close", "Cancel"],
+                                cx,
+                            )
+                        })?;
+                        match answer.await {
+                            Ok(0) => {}
+                            _ => should_close = false,
+                        }
+                    }
+                }
+
                 // Remove the item from the pane.
                 if should_close {
                     pane.update_in(cx, |pane, window, cx| {
@@ -4348,7 +4370,6 @@ impl Render for Pane {
                 pane.child((self.render_tab_bar.clone())(self, window, cx))
             })
             .child({
-                let has_worktrees = project.read(cx).visible_worktrees(cx).next().is_some();
                 // main content
                 div()
                     .flex_1()
@@ -4384,7 +4405,7 @@ impl Render for Pane {
                                         }
                                     },
                                 ));
-                            if has_worktrees || !self.should_display_welcome_page {
+                            if !self.should_display_welcome_page {
                                 placeholder
                             } else {
                                 if self.welcome_page.is_none() {
@@ -5715,6 +5736,34 @@ mod tests {
             pane.unpin_tab_at(ix, window, cx);
         });
         assert_item_labels(&pane, ["C", "A", "B*"], cx);
+    }
+
+    #[gpui::test]
+    async fn test_empty_center_pane_shows_welcome_page_with_visible_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, ["root".as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        let item = add_labeled_item(&pane, "Terminal", false, cx);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.remove_item(item.item_id(), false, true, window, cx);
+        });
+
+        cx.run_until_parked();
+
+        assert!(
+            pane.update_in(cx, |pane, window, cx| {
+                let _ = pane.render(window, cx);
+                pane.welcome_page.is_some()
+            }),
+            "welcome page should be rendered for an empty center pane even when the project has visible worktrees"
+        );
     }
 
     #[gpui::test]
